@@ -72,6 +72,23 @@ jobs:
                   print(f"Applied: {path.name}: {import_line}")
               else:
                   print(f"Already present: {path.name}: {import_line}")
+
+          # ProtocolLab.restoreHci.counts() has a block body with an explicit
+          # Map return. Without the return keyword Kotlin reports:
+          # "ProtocolLab.kt: Missing return statement."
+          protocol_lab = root / "app/src/main/java/com/nordbuds/studio/ProtocolLab.kt"
+          if not protocol_lab.exists():
+              raise SystemExit(f"Expected source file missing: {protocol_lab}")
+          source = protocol_lab.read_text()
+          broken = "j.keys().forEach { k -> k.toIntOrNull()?.let { out[it]=j.optInt(k) } }; out"
+          fixed = "j.keys().forEach { k -> k.toIntOrNull()?.let { out[it]=j.optInt(k) } }\n                    return out"
+          if broken in source:
+              protocol_lab.write_text(source.replace(broken, fixed, 1))
+              print("Applied: ProtocolLab.kt: explicit return in counts()")
+          elif fixed in source:
+              print("Already fixed: ProtocolLab.kt counts()")
+          else:
+              raise SystemExit("ProtocolLab.kt counts() did not match the known source pattern; stop rather than patch blindly.")
           PY
 
       - name: Set up Java 17
