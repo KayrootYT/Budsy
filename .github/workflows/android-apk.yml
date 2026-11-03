@@ -19,106 +19,72 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Unzip budsy.zip if project is still zipped
+      - name: Select project source (prefer Budsy.zip)
+        id: project
+        shell: bash
         run: |
-          if [ -z "$(find . -name settings.gradle.kts -not -path "*/node_modules/*" | head -n1)" ]; then
-            z=$(find . -iname "*.zip" | head -n1)
-            if [ -n "$z" ]; then
-              echo "Extracting $z"
-              mkdir -p _project
-              unzip -q -o "$z" -d _project
-            fi
+          set -euo pipefail
+          rm -rf _project
+          archive="$(find . -maxdepth 2 -type f \( -iname 'Budsy.zip' -o -iname 'budsy.zip' \) -not -path './.git/*' | head -n 1 || true)"
+          if [ -n "$archive" ]; then
+            echo "Using project archive: $archive"
+            mkdir -p _project
+            unzip -q -o "$archive" -d _project
+            root="_project"
+          else
+            echo "Budsy.zip not found; using checked-out project files"
+            root="."
           fi
-
-      - name: Find Gradle project folder
-        id: p
-        run: |
-          f=$(find . -name settings.gradle.kts -not -path "*/node_modules/*" | head -n1)
-          if [ -z "$f" ]; then
-            echo "::error::settings.gradle.kts not found. Upload the extracted Budsy project files (app folder, settings.gradle.kts, build.gradle.kts) to the repo."
-            ls -R | head -40
+          settings="$(find "$root" -type f -name settings.gradle.kts -not -path '*/.gradle/*' -not -path '*/build/*' | head -n 1 || true)"
+          if [ -z "$settings" ]; then
+            echo '::error::settings.gradle.kts not found in Budsy.zip or repository.'
+            find "$root" -maxdepth 4 -type f | head -100
             exit 1
           fi
-          echo "dir=$(dirname "$f")" >> "$GITHUB_OUTPUT"
-
-      - name: Apply known Kotlin compile fixes
-        env:
-          PROJECT_DIR: ${{ steps.p.outputs.dir }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          root = Path(os.environ["PROJECT_DIR"])
-          fixes = {
-              root / "app/src/main/java/com/nordbuds/studio/MainActivity.kt":
-                  "import androidx.compose.animation.core.animateFloat",
-              root / "app/src/main/java/com/nordbuds/studio/Screens.kt":
-                  "import androidx.compose.foundation.border",
-          }
-          for path, import_line in fixes.items():
-              if not path.exists():
-                  raise SystemExit(f"Expected source file missing: {path}")
-              text = path.read_text()
-              if import_line not in text:
-                  lines = text.splitlines()
-                  package_idx = next((i for i, line in enumerate(lines) if line.startswith("package ")), None)
-                  if package_idx is None:
-                      raise SystemExit(f"Package declaration missing: {path}")
-                  lines.insert(package_idx + 2, import_line)
-                  path.write_text("\n".join(lines) + "\n")
-                  print(f"Applied: {path.name}: {import_line}")
-              else:
-                  print(f"Already present: {path.name}: {import_line}")
-
-          # ProtocolLab.restoreHci.counts() has a block body with an explicit
-          # Map return. Without the return keyword Kotlin reports:
-          # "ProtocolLab.kt: Missing return statement."
-          protocol_lab = root / "app/src/main/java/com/nordbuds/studio/ProtocolLab.kt"
-          if not protocol_lab.exists():
-              raise SystemExit(f"Expected source file missing: {protocol_lab}")
-          source = protocol_lab.read_text()
-          broken = "j.keys().forEach { k -> k.toIntOrNull()?.let { out[it]=j.optInt(k) } }; out"
-          fixed = "j.keys().forEach { k -> k.toIntOrNull()?.let { out[it]=j.optInt(k) } }\n                    return out"
-          if broken in source:
-              protocol_lab.write_text(source.replace(broken, fixed, 1))
-              print("Applied: ProtocolLab.kt: explicit return in counts()")
-          elif fixed in source:
-              print("Already fixed: ProtocolLab.kt counts()")
-          else:
-              raise SystemExit("ProtocolLab.kt counts() did not match the known source pattern; stop rather than patch blindly.")
-          PY
+          project_dir="$(dirname "$settings")"
+          if [ ! -f "$project_dir/app/build.gradle.kts" ]; then
+            echo "::error::Android module not found under $project_dir/app"
+            find "$project_dir" -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+          echo "dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Selected Gradle project: $project_dir"
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platform-tools platforms;android-35 build-tools;35.0.0"
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Accept Android licenses
-        run: yes | sdkmanager --licenses > /dev/null || true
+        run: yes | sdkmanager --licenses >/dev/null || true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
       - name: Build debug APK
-        working-directory: ${{ steps.p.outputs.dir }}
-        run: gradle assembleDebug --no-daemon --stacktrace
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: gradle --no-daemon --stacktrace clean testDebugUnitTest assembleDebug
 
-      - name: Rename APK
-        run: cp "${{ steps.p.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk" Budsy.apk
+      - name: Verify APK exists and is non-empty
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: test -s app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Copy APK using stable filename
+        run: cp "${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk" Budsy.apk
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Budsy-apk
           path: Budsy.apk
@@ -126,9 +92,11 @@ jobs:
 
       - name: Upload build reports on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-reports
           path: |
-            ${{ steps.p.outputs.dir }}/app/build/reports
+            ${{ steps.project.outputs.dir }}/app/build/reports
+            ${{ steps.project.outputs.dir }}/app/build/outputs/logs
           if-no-files-found: ignore
+          
